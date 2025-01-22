@@ -7,20 +7,30 @@ use regex::Regex;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
+use which::which;
+
+use inquire::formatter::MultiOptionFormatter;
+use inquire::{Confirm, MultiSelect};
 use std::collections::HashMap;
 use std::io::Write;
-use std::{fs, io, thread};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, UNIX_EPOCH};
+use std::{fs, io};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     // Query (SMWCentral ID or URL)
     #[arg(short, long)]
-    query: String
+    query: String,
+
+    #[arg(short, long)]
+    album: String,
+
+    #[arg(short="ca", long)]
+    coverart: String
 }
 
 #[derive(Deserialize, Debug)]
@@ -80,6 +90,7 @@ where
     })
 }
 
+
 /// Parses Unix time to human-readable time object + timezone difference.
 fn unix_to_hrtime(unix_off: u64) -> DateTime<Utc> {
     let tz_off = Local::now().offset().local_minus_utc();
@@ -129,12 +140,6 @@ fn alphamap(str: &str, mapper: &HashMap<char, char>) -> String {
         .collect()
 }
 
-/// Clears previously written line using VT100 clear line escape code.
-fn tm_clearline() {
-    print!("\x1B[A");
-    io::stdout().flush().unwrap();
-}
-
 /// Downloads file at specified URL and updates provided indicatif bar. Specific to this project (s2w).
 fn s2w_download(url: &str, dest: &str, client: &reqwest::blocking::Client, size: u64) {
     let resp = client.get(url).send().unwrap();
@@ -158,12 +163,12 @@ fn s2w_download(url: &str, dest: &str, client: &reqwest::blocking::Client, size:
     bar.finish_and_clear();
 }
 
-/// Extracts file at provided location and updates indicatif bar. Specific to this project (s2w).
+/// Extracts files at provided location and updates indicatif bar. Specific to this project (s2w; only keeps .spc).
 fn s2w_extract(loc: &str) {
-    // From crate example https://github.com/zip-rs/zip2/blob/7c20fa30016301909bf2ade203cb4841b7776154/examples/extract.rs
+    // Modified from "zip" crate example https://github.com/zip-rs/zip2/blob/7c20fa30016301909bf2ade203cb4841b7776154/examples/extract.rs
 
-    let file = fs::File::open(loc).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let archive_file = fs::File::open(loc).unwrap();
+    let mut archive = zip::ZipArchive::new(archive_file).unwrap();
 
     let bar = ProgressBar::new(archive.len() as u64);
     bar.set_style(ProgressStyle::with_template("{bar:83} {percent:0}% ({pos}/{len})")
@@ -171,27 +176,25 @@ fn s2w_extract(loc: &str) {
         .progress_chars("█▒░"));
 
     for i in 0..archive.len() {
-        let mut a_file = archive.by_index(i).unwrap();
-        let a_outpath = match a_file.enclosed_name() {
+        bar.inc(1);
+
+        let mut file = archive.by_index(i).unwrap();
+
+        // Validate path (skip pass if invalid)
+        let fpath = match file.enclosed_name() {
             Some(path) => path,
-            None => continue,
+            None => continue
         };
 
-        // If directory, create it! Otherwise, create file (and parent dirs if needed).
-        if a_file.is_dir() {
-            fs::create_dir_all(&a_outpath).unwrap();
+        // Check file extension (skip pass if not .spc — this implicitly removes directories!)
+        if fpath.extension().and_then(|e| e.to_str()).is_some_and(|e| e == "spc") {
+            // Yank file to base directory and write file
+            let bpath = fpath.file_name().unwrap();
+            let mut outfile = fs::File::create(&bpath).unwrap();
+            io::copy(&mut file, &mut outfile).unwrap();
         } else {
-            if let Some(p) = a_outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p).unwrap();
-                }
-            }
-            let mut a_outfile = fs::File::create(&a_outpath).unwrap();
-            io::copy(&mut a_file, &mut a_outfile).unwrap();
+            sleep(Duration::from_millis(20));
         }
-
-        bar.inc(1);
-        sleep(Duration::from_millis(4));
     }
 
     // Delete zip file
@@ -214,8 +217,14 @@ fn s2w_conv(loc: &str) {
         .expect("Violation of: spc2wav could not be run (is it installed?)");
 
     bar.inc(1);
-    sleep(Duration::from_millis(15));
+    sleep(Duration::from_millis(20));
     bar.finish_and_clear();
+}
+
+/// Overwrites previous printed line (assuming println) with text and flushes stdout. Use format macro for stringf.
+fn ow_print(str: &str) {
+    println!("\x1B[A\x1B[2K{}", str);
+    io::stdout().flush().unwrap();
 }
 
 fn main() {
@@ -270,14 +279,15 @@ fn main() {
     print!("Confirm download...");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut String::new()).unwrap();
-    println!("\rDownloading zip (1/3)");
+    ow_print("Downloading zip (1/3)");
     let zip_fname = file.id.to_string() + ".zip";
     s2w_download(&*file.download_url, &*zip_fname, &client, file.size as u64);
 
-    print!("\x1B[A\x1B[AExtracting zip (2/3)");
+    ow_print("Extracting zip (2/3)");
+    io::stdout().flush().unwrap();
     s2w_extract(&zip_fname);
 
-    print!("\x1B[A\x1B[AConverting .spc (3/3)");
+    ow_print("Converting spc → wav (3/3)");
     let all_files = fs::read_dir(".").unwrap();
     let spc_files: Vec<_> = all_files
         .filter_map(Result::ok)
@@ -291,5 +301,45 @@ fn main() {
     s2w_conv(spc);
 
     let wav = fs::metadata(&spc.replace("spc", "wav"));
-    println!("{} of pure joy saved ✔", HumanBytes(wav.unwrap().size()));
+    ow_print(&format!("\x1B[38;2;41;255;188m{} of 16-bit goodness saved ✔\x1B[0m", HumanBytes(wav.unwrap().size())));
+
+    let has_sox: bool = which("sox").unwrap().exists();
+    let mut inq_opts: Vec<&str> = vec!["Purge"];
+
+    if has_sox {
+        inq_opts.push("Convert (lossless)");
+        inq_opts.push( "Convert (lossy)");
+    }
+
+    inq_opts.push("Stats");
+
+    let inq_fmt: MultiOptionFormatter<'_, &str> = &|a| format!("{} queued", a.len());
+    let inq = MultiSelect::new("Select additional operations...", inq_opts)
+        .with_formatter(inq_fmt)
+        .prompt()
+        .unwrap();
+
+    inq.iter().for_each(|s| match s {
+        &"Purge" => {
+            let is_purge = Confirm::new("Purge song?")
+                .with_default(false)
+                .with_help_message("This permanently removes this session's files.")
+                .prompt();
+        },
+
+        &"Convert (lossless)" | &"Convert (lossy)" => {
+            let id3_title = file.name;
+            let id3_artist = file.authors.join(", ");
+            let id3_album = args.album;
+            let id3_comment = "Processed by smwc2wav";
+            let id3_date = format!("{}-{}-{}", hrtime.year(), hrtime.month(), hrtime.day());
+            let id3_coverart = args.coverart;
+
+        },
+
+        &"Stats" => {
+
+        }
+        _ => {}
+    });
 }
