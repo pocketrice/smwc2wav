@@ -127,7 +127,10 @@ struct Cli {
     album: Option<String>,
 
     #[arg(short, long, default_missing_value = None)]
-    coverart: Option<String>
+    coverart: Option<String>,
+
+    #[arg(short, long, default_missing_value = None, default_value = Some("skip".into()))]
+    format: Option<String>
 }
 
 #[derive(Deserialize, Debug)]
@@ -270,6 +273,7 @@ fn s2w_extract(loc: &str) {
     bar.set_style(ProgressStyle::with_template("{bar:83} {percent:0}% ({pos}/{len})")
         .unwrap()
         .progress_chars("█▒░"));
+    bar.tick();
 
     for i in 0..archive.len() {
         bar.inc(1);
@@ -316,26 +320,34 @@ fn s2w_conv(loc: &str) {
     fs::remove_file(loc).expect("Could not delete .spc file");
 
     bar.inc(1);
-    sleep(Duration::from_millis(20));
+    sleep(Duration::from_millis(10));
     bar.finish_and_clear();
 }
 
 /// Overwrites previous printed line (assuming println) with text and flushes stdout. Use format macro for stringf.
-fn ow_print(str: &str) {
-    println!("\x1B[A\x1B[2K{}", str);
+fn ow_printl(str: &str, lines: usize) {
+    println!("{}\x1B[2K{}{}", "\x1B[A".repeat(lines), str, "\x1B[B".repeat(lines-1));
     io::stdout().flush().unwrap();
+}
+
+fn ow_print(str: &str) {
+    ow_printl(str, 1);
+}
+
+/// Converts byte(s) to hex representation in string.
+fn hex_str(bytes: &[u8], delim: &str) -> String {
+    bytes.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<String>>()
+        .join(delim)
 }
 
 /// Get filetype by magic number.
 /// Note standards may change, # not present, etc.
 fn magictype(data: &Vec<u8>) -> Option<FileType> {
-    let data_str = data.iter()
-        .map(|&b| b.to_string())
-        .collect::<Vec<String>>()
-        .join(";")
-        .to_uppercase();
+    let data_str = hex_str(data, ";").to_uppercase();
 
-    FileType::iter().find(|f| is_regex!(f.magic(), &data_str))
+    FileType::iter().find(|f| is_regex!(&data_str, f.magic()))
 }
 
 
@@ -355,6 +367,11 @@ fn main() {
 
 
     // Validate arguments first for the sake of not hitting the user with a panic 3 minutes into operation
+    let (is_skip, is_format_valid) = match args.format {
+        Some(f) if f == "skip" => (true, false),
+        Some(f) if is_regex!(&f, "(?i)(flac|mp3|aiff|ogg)") => (false, true),
+        _ => panic!("Invalid conversion format! Must be flac/mp3/aiff/ogg"),
+    };
 
     let ca_data: Option<(Vec<u8>, MimeType)> = if let Some(ca) = args.coverart {
         let ca_file = fs::read(ca).expect("Cover art image could not be read");
@@ -378,7 +395,7 @@ fn main() {
     let is_featured = file.raw_fields.featured;
 
     let hrtime = unix_to_hrtime(file.time);
-    let alphamapper = alphavec_to_map(TINY_CAPS_MAPPING);
+    //let alphamapper = alphavec_to_map(TINY_CAPS_MAPPING);
 
     println!("\x1B[38;2;131;125;246m\n▓▓▓▓▓▓▓▓▓▒▓▓▓▓▒▒▒▒▒▒▓▓▒▒▓▒▒▒▒▒░▒▒▒▒▒▒▒▒░▒▒░░▒▒▒▒▒░░░▒▒░▒░▒▒░░▒▒▒▒▒░▒▒░░░░▒▒▒░░░░░▒░▒░░░░░▒░░░░░▒░░░░░░░░░░░░░\n");
 
@@ -439,16 +456,25 @@ fn main() {
     let has_ffmpeg: bool = which("ffmpeg").unwrap().exists();
     let is_conv = Confirm::new("SoX detected. Convert audio format?").prompt();
 
-    if has_sox && is_conv.expect("No choice!") {
-        let conv_opts: Vec<&str> = vec!["flac", "mp3", "aiff", "ogg"];
-        let conv_format = Select::new("Select format:", conv_opts).prompt().unwrap();
+    if !is_skip && has_sox && is_conv.expect("No choice!") {
+        let conv_format: &str = if is_format_valid {
+            // TODO: get args.format
+            println!();
+            "flac"
+        } else {
+            Select::new("Select format:", vec!["flac", "mp3", "aiff", "ogg"]).prompt().unwrap()
+        };
+
         let conv_name = &wav_name.replace(".wav", &format!(".{}", conv_format));
-        
+        ow_printl("\x1B[38;2;143;122;238mProcessing via SoX...\x1B[0m", 3);
+
         Command::new("sox")
             .arg(wav_name)
             .arg(conv_name)
             .output()
             .expect("SoX failed to convert file.");
+
+        ow_printl(&format!("\x1B[38;2;41;255;188m{} → {} converted ✔\x1B[0m", HumanBytes(wav_meta.size()), HumanBytes(fs::metadata(conv_name).unwrap().size())), 3);
 
         fs::remove_file(wav_name).expect("Could not remove .wav file");
 
