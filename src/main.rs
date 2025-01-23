@@ -8,16 +8,113 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use which::which;
+use audiotags::{Album, MimeType, Picture, Tag};
+use inquire::{Confirm, Select};
+use strum::IntoEnumIterator;
+use strum_macros::{AsRefStr, EnumIter};
 
-use inquire::formatter::MultiOptionFormatter;
-use inquire::{Confirm, MultiSelect};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{fs, io};
+use std::io::Error;
+
+const TINY_CAPS_MAPPING: [char; 26] = ['ᴀ', 'ʙ', 'ᴄ', 'ᴅ', 'ᴇ', 'ғ', 'ɢ', 'ʜ', 'ɪ', 'ᴊ', 'ᴋ', 'ʟ', 'ᴍ', 'ɴ', 'ᴏ', 'ᴘ', 'ꞯ', 'ʀ', 's', 'ᴛ', 'ᴜ', 'ᴠ', 'ᴡ', 'x', 'ʏ', 'ᴢ'];
+
+// Based on https://en.wikipedia.org/wiki/Magic_number_(programming)
+#[derive(AsRefStr, EnumIter, PartialEq)]
+enum FileType {
+    JPEG,
+    GIF,
+    PNG,
+    VTF,
+    MIDI,
+    UnixScript,
+    ELF,
+    PDF,
+    MBR,
+    TIFF,
+    WAD,
+    ZIP,
+    TAR,
+    XML,
+    TXT,
+    HEIC,
+    WEBP,
+    NES,
+    BMP,
+    SPC,
+    WAV,
+    AVI,
+    AIFF,
+    MP3,
+    MP4,
+    OGG,
+    FLAC,
+    M4A,
+    AAC
+}
+
+impl FileType {
+    // Returned as a regex pattern with byte values delimited with ; for the sake of generic sizing.
+    // e.g. [4A BC] or [A3 BB 9F] -> (4A;BC|A3;BB;9F)
+    fn magic(&self) -> &str {
+        match *self {
+            FileType::JPEG => "(FF;D8;FF;DB|FF;D8;FF;E0;00;10;4A;46;49;46;00;01|FF;D8;FF;EE|FF;D8;FF;E1;([0-9A-F]{2};){2}45;78;69;66;00;00|FF;D8;FF;E0)", // TODO: this excludes JPEG2000, needed?
+            FileType::GIF => "(47;49;46;38;39;61|47;49;46;38;37;61).*", // GIF89a or GIF87a
+            FileType::PNG => "(89;50;4E;47;0D;0A;1A;0A).*", // \211PNG\r\n\032\n
+            FileType::VTF => "(00;46;54;56).*", // VTF\0 (https://developer.valvesoftware.com/wiki/VTF_(Valve_Texture_Format))
+            FileType::MIDI => "(4D;54;68;64).*", // MThd
+            FileType::UnixScript => "(23;21).*", // #!
+            FileType::ELF => "(7F;45;4C;46).*", // 0x7F + ELF
+            FileType::PDF => "(25;50;44;46;2D).*", // %PDF-
+            FileType::MBR => ".*(55;AA)", // 0x55AA
+            FileType::TIFF => "(49;49;2A;00|4D;4D;00;2A|49;49;2B;00|4D;4D;00;2B).*", // II (le) or MM (be) + 0x42
+            FileType::WAD => "(49;57;41;44|50;57;41;44|57;41;44;32|57;41;44;33).*", // IWAD/PWAD (Doom), WAD2 (Quake), WAD3 (Half-Life)
+            FileType::ZIP => "(50;4B;03:04).*", // PK♥♦
+            FileType::TAR => "(75;73;74;61;72;00;30;30|75;73;74;61;72;20;20;00).*", // ustar␀00 or ustar␠␠␀
+            FileType::XML => "(3C;3F;78;6D;6C;20|3C;00;3F;00;78;00;6D;00;6C;00;20|00;3C;00;3F;00;78;00;6D;00;6C;00;20|3C;00;00;00;3F;00;00;00;78;00;00;00;6D;00;00;00;6C;00;00;00;20;00;00;00|00;00;00;3C;00;00;00;3F;00;00;00;78;00;00;00;6D;00;00;00;6C;00;00;00;20).*",
+            FileType::TXT => "(EF;BB;BF|FF;FE|FE;FF|FF;FE;00;00|00;00;FE;FF).*", // ï»¿, ÿþ, þÿ, ÿþ␀␀, or ␀␀þÿ
+            FileType::HEIC => "(66;74;79;70;68;65;69;63;66;74;79;70;6D", // ftypheic
+            FileType::WEBP => "(52;49;46;46;([0-9A-F]{2};){4}57;45;42;50).*", // RIFF????WEBP
+            FileType::NES => "(4E;45;53;1A).*", // NES␚
+            FileType::BMP => "(42;4D).*", // BM
+            FileType::SPC => "(53;4E;45;53;2D;53;50;43;37;30;30;20;53;6F;75;6E;64;20;46;69;6C;65;20;44;61;74;61;20;76;30;2E;33;30;1A;1A).*", // SNES-SPC700 Sound File Data v0.30 + 2x 0x26
+            FileType::WAV => "(52;49;46;46;([0-9A-F]{2};){4}57;41;56;45).*", // RIFF????WAVE
+            FileType::AVI => "(52;49;46;46;([0-9A-F]{2};){4}41;56;49;20).*", // RIFF????AVI␠
+            FileType::AIFF => "(46;4F;52;4D;([0-9A-F]{2};){4}41;49;46;46).*", // FORM????AIFF
+            FileType::MP3 => "(FF;FB|FF;F3|FF;F2|49;44;33).*", // ÿû, ÿó, or ÿò (or ID3)
+            FileType::MP4 => "(66;74;79;70;4D;53;4E;56).*", // ftypMSNV
+            FileType::OGG => "(4F;67;67;53).*", // OggS
+            FileType::FLAC => "(66;4C;61;43).*", // fLaC
+            FileType::M4A => "(00;00;00;(1C|20);66;74;79;70;4D;34;41;20).*", // 0x000000 ftypM4A. There was a single byte difference for some reason? Also could also be M4A_? (https://docs.fileformat.com/audio/m4a/)
+            FileType::AAC => "(FF;F1|FF;F9).*", // ÿñ or ÿù
+        }
+    }
+
+    /// Utility method for converting to audiotags::MimeType
+    fn mime(&self) -> Result<MimeType, Error> {
+        match *self {
+            FileType::JPEG => Ok(MimeType::Jpeg),
+            FileType::PNG => Ok(MimeType::Png),
+            FileType::TIFF => Ok(MimeType::Tiff),
+            FileType::BMP => Ok(MimeType::Bmp),
+            FileType::GIF => Ok(MimeType::Gif),
+            _ => Err(Error::from(ErrorKind::Unsupported)) // TODO: wrong way to indicate unsupported datatype?
+        }
+    }
+}
+
+macro_rules! is_regex {
+    ($str:expr, $pat:expr) => {{
+        use regex::Regex;
+        let re = Regex::new($pat).unwrap();
+        re.is_match($str)
+    }}
+}
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -26,11 +123,11 @@ struct Cli {
     #[arg(short, long)]
     query: String,
 
-    #[arg(short, long)]
-    album: String,
+    #[arg(short, long, default_missing_value = None)]
+    album: Option<String>,
 
-    #[arg(short="ca", long)]
-    coverart: String
+    #[arg(short, long, default_missing_value = None)]
+    coverart: Option<String>
 }
 
 #[derive(Deserialize, Debug)]
@@ -70,8 +167,6 @@ struct SMWCFile {
     raw_fields: SMWCAudioFields
 }
 
-const TINY_CAPS_MAPPING: [char; 26] = ['ᴀ', 'ʙ', 'ᴄ', 'ᴅ', 'ᴇ', 'ғ', 'ɢ', 'ʜ', 'ɪ', 'ᴊ', 'ᴋ', 'ʟ', 'ᴍ', 'ɴ', 'ᴏ', 'ᴘ', 'ꞯ', 'ʀ', 's', 'ᴛ', 'ᴜ', 'ᴠ', 'ᴡ', 'x', 'ʏ', 'ᴢ'];
-
 
 /// Serde JSON deserialiser to capture anything as a string (* -> String)
 fn de_unistr<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -80,6 +175,7 @@ where
 {
     // Deserialize into blanket serde_json::Value then case-match
     let value = Value::deserialize(deserializer)?;
+
     Ok(match value {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
@@ -111,7 +207,7 @@ fn q_str(active_c: &char, inactive_c: &char, active_q: u8, total_q: u8) -> Strin
 fn strip_html(h_str: &str) -> String {
     let res = h_str.replace("<br>\\r\\n", "\n");
     let rgx = Regex::new("r(\\n)+").unwrap();
-    rgx.replace_all(&*res, "\n").to_string()
+    rgx.replace_all(&*res, "\n").into()
 }
 
 /// Converts alphabetical vector of mappings to map.
@@ -205,16 +301,19 @@ fn s2w_extract(loc: &str) {
 
 /// Converts specified .spc file to .wav using spc2wav utility and updates indicatif bar. Specific to this project (s2w).
 fn s2w_conv(loc: &str) {
-
     let bar = ProgressBar::new(1);
     bar.set_style(ProgressStyle::with_template("{bar:83} {percent:0}% ({pos}/{len})")
         .unwrap()
         .progress_chars("█▒░"));
 
+    bar.tick();
+
     Command::new("spc2wav")
         .arg(loc)
         .output()
         .expect("Violation of: spc2wav could not be run (is it installed?)");
+
+    fs::remove_file(loc).expect("Could not delete .spc file");
 
     bar.inc(1);
     sleep(Duration::from_millis(20));
@@ -227,6 +326,19 @@ fn ow_print(str: &str) {
     io::stdout().flush().unwrap();
 }
 
+/// Get filetype by magic number.
+/// Note standards may change, # not present, etc.
+fn magictype(data: &Vec<u8>) -> Option<FileType> {
+    let data_str = data.iter()
+        .map(|&b| b.to_string())
+        .collect::<Vec<String>>()
+        .join(";")
+        .to_uppercase();
+
+    FileType::iter().find(|f| is_regex!(f.magic(), &data_str))
+}
+
+
 fn main() {
     // Arguments...
     // smwc2wav — CLI browser for SMWCentral "Music" section + searching.
@@ -236,8 +348,27 @@ fn main() {
     // smwc2wav -i [ID]
     // smwc2wav -u [URL] — handy for quick C+P from browser
 
+
+
     let client = reqwest::blocking::Client::new();
     let args = Cli::parse();
+
+
+    // Validate arguments first for the sake of not hitting the user with a panic 3 minutes into operation
+
+    let ca_data: Option<(Vec<u8>, MimeType)> = if let Some(ca) = args.coverart {
+        let ca_file = fs::read(ca).expect("Cover art image could not be read");
+        let ca_meta = magictype(&ca_file).expect("Cover art file could not be identified");
+        let ca_mime = ca_meta.mime();
+
+        if ca_mime.is_err() {
+            panic!("Improper MIME type!");
+        }
+
+        Some((ca_file, ca_mime.unwrap()))
+    } else {
+        None
+    };
 
     let smwc_api = Url::parse(&*format!("https://www.smwcentral.net/ajax.php?a=getfile&v=2&id={}", args.query)).expect("Violation of: invalid SMWc API URL!");;
     let api_resp = client.get(smwc_api).send().unwrap();
@@ -297,49 +428,49 @@ fn main() {
         .collect();
 
     let spc_fname = spc_files[0].file_name();
-    let spc = spc_fname.to_str().unwrap();
-    s2w_conv(spc);
+    let spc_name = spc_fname.to_str().unwrap();
+    s2w_conv(spc_name);
 
-    let wav = fs::metadata(&spc.replace("spc", "wav"));
-    ow_print(&format!("\x1B[38;2;41;255;188m{} of 16-bit goodness saved ✔\x1B[0m", HumanBytes(wav.unwrap().size())));
+    let wav_name = &spc_name.replace(".spc", ".wav");
+    let wav_meta = fs::metadata(wav_name).unwrap();
+    ow_print(&format!("\x1B[38;2;41;255;188m{} of 16-bit goodness saved ✔\x1B[0m", HumanBytes(wav_meta.size())));
 
     let has_sox: bool = which("sox").unwrap().exists();
-    let mut inq_opts: Vec<&str> = vec!["Purge"];
+    let has_ffmpeg: bool = which("ffmpeg").unwrap().exists();
+    let is_conv = Confirm::new("SoX detected. Convert audio format?").prompt();
 
-    if has_sox {
-        inq_opts.push("Convert (lossless)");
-        inq_opts.push( "Convert (lossy)");
-    }
+    if has_sox && is_conv.expect("No choice!") {
+        let conv_opts: Vec<&str> = vec!["flac", "mp3", "aiff", "ogg"];
+        let conv_format = Select::new("Select format:", conv_opts).prompt().unwrap();
+        let conv_name = &wav_name.replace(".wav", &format!(".{}", conv_format));
+        
+        Command::new("sox")
+            .arg(wav_name)
+            .arg(conv_name)
+            .output()
+            .expect("SoX failed to convert file.");
 
-    inq_opts.push("Stats");
+        fs::remove_file(wav_name).expect("Could not remove .wav file");
 
-    let inq_fmt: MultiOptionFormatter<'_, &str> = &|a| format!("{} queued", a.len());
-    let inq = MultiSelect::new("Select additional operations...", inq_opts)
-        .with_formatter(inq_fmt)
-        .prompt()
-        .unwrap();
+        let mut tag = Tag::default().read_from_path(conv_name).unwrap();
+        tag.set_title(&*file.name);
+        tag.set_artist(&*file.authors.iter()
+            .map(|a| a.name.clone())
+            .collect::<Vec<String>>()
+            .join(", "));
 
-    inq.iter().for_each(|s| match s {
-        &"Purge" => {
-            let is_purge = Confirm::new("Purge song?")
-                .with_default(false)
-                .with_help_message("This permanently removes this session's files.")
-                .prompt();
-        },
-
-        &"Convert (lossless)" | &"Convert (lossy)" => {
-            let id3_title = file.name;
-            let id3_artist = file.authors.join(", ");
-            let id3_album = args.album;
-            let id3_comment = "Processed by smwc2wav";
-            let id3_date = format!("{}-{}-{}", hrtime.year(), hrtime.month(), hrtime.day());
-            let id3_coverart = args.coverart;
-
-        },
-
-        &"Stats" => {
-
+        if let Some(album) = args.album {
+            tag.set_album(Album::with_title(&album));
         }
-        _ => {}
-    });
+
+        if let Some((ca_file, ca_mime)) = ca_data {
+            tag.set_album_cover(Picture::new(&*ca_file, ca_mime));
+        }
+
+        tag.set_year(hrtime.year());
+        tag.set_comment("Processed by smwc2wav".into());
+        tag.set_genre("Game");
+
+        tag.write_to_path(conv_name).expect("Failed to save ID3 tags");
+    }
 }
