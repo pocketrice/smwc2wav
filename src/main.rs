@@ -161,7 +161,7 @@ struct SMWCFile {
     submitter: Option<SMWCUser>,
     tags: Vec<String>,
     images: Option<Vec<String>>,
-    rating: Option<u8>,
+    rating: Option<f32>,
     size: u32,
     downloads: u16,
     download_url: String,
@@ -413,7 +413,7 @@ fn main() {
     println!("     │\n     └── @ {}-{}-{} {}:{}:{}", hrtime.month(), hrtime.day(), hrtime.year(), hrtime.hour(), hrtime.minute(), hrtime.second());
 
     match file.rating {
-        Some(r) => print!("        │\n        └── {}", q_str(&'★', &'☆', r, 5)),
+        Some(r) => print!("        │\n        └── {}", q_str(&'★', &'☆', r as u8, 5)),
         None => print!("        │\n        └── (no rating)")
     }
     println!(" {} downloads\n\n", file.downloads);
