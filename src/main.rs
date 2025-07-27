@@ -21,6 +21,7 @@ use std::thread::sleep;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{fs, io};
 use std::io::Error;
+use regex_macro::regex;
 
 const TINY_CAPS_MAPPING: [char; 26] = ['ᴀ', 'ʙ', 'ᴄ', 'ᴅ', 'ᴇ', 'ғ', 'ɢ', 'ʜ', 'ɪ', 'ᴊ', 'ᴋ', 'ʟ', 'ᴍ', 'ɴ', 'ᴏ', 'ᴘ', 'ꞯ', 'ʀ', 's', 'ᴛ', 'ᴜ', 'ᴠ', 'ᴡ', 'x', 'ʏ', 'ᴢ'];
 
@@ -108,10 +109,11 @@ impl FileType {
     }
 }
 
+/// Macro for lazy-checking if string matches pattern.
 macro_rules! is_regex {
     ($str:expr, $pat:expr) => {{
         use regex::Regex;
-        let re = Regex::new($pat).unwrap();
+        let re = regex!($pat).unwrap();
         re.is_match($str)
     }}
 }
@@ -119,6 +121,9 @@ macro_rules! is_regex {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    // #[command(flatten)]
+    // verbose: clap_verbosity_flag::Verbosity,
+
     // Query (SMWCentral ID or URL)
     #[arg(short, long)]
     query: String,
@@ -129,8 +134,11 @@ struct Cli {
     #[arg(short, long, default_missing_value = None)]
     coverart: Option<String>,
 
+    #[arg(short, long, default_missing_value = None)]
+    immediate: Option<bool>,
+
     #[arg(short, long, default_missing_value = None, default_value = Some("skip".into()))]
-    format: Option<String>
+    format: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -367,9 +375,9 @@ fn main() {
 
 
     // Validate arguments first for the sake of not hitting the user with a panic 3 minutes into operation
-    let (is_skip, is_format_valid) = match args.format {
+    let (is_skip, is_format_valid) = match &args.format {
         Some(f) if f == "skip" => (true, false),
-        Some(f) if is_regex!(&f, "(?i)(flac|mp3|aiff|ogg)") => (false, true),
+        Some(f) if is_regex!(f, "(?i)(flac|mp3|aiff|ogg)") => (false, true),
         _ => panic!("Invalid conversion format! Must be flac/mp3/aiff/ogg"),
     };
 
@@ -387,9 +395,13 @@ fn main() {
         None
     };
 
-    let smwc_api = Url::parse(&*format!("https://www.smwcentral.net/ajax.php?a=getfile&v=2&id={}", args.query)).expect("Violation of: invalid SMWc API URL!");;
+    let id = {
+        let pat = regex!("[0-9]*$");
+        pat.find(&args.query).unwrap().as_str()
+    };
+    let smwc_api = Url::parse(&format!("https://www.smwcentral.net/ajax.php?a=getfile&v=2&id={}", id)).expect("Violation of: invalid SMWc API URL!");
     let api_resp = client.get(smwc_api).send().unwrap();
-    let file: SMWCFile = api_resp.json().unwrap();
+    let file: SMWCFile = api_resp.json().expect("Could not connect to SMWCentral or ID invalid.");
 
     let is_obsolete = file.obsoleted_by.is_some();
     let is_featured = file.raw_fields.featured;
@@ -454,49 +466,50 @@ fn main() {
 
     let has_sox: bool = which("sox").unwrap().exists();
     let has_ffmpeg: bool = which("ffmpeg").unwrap().exists();
-    let is_conv = Confirm::new("SoX detected. Convert audio format?").prompt();
 
-    if !is_skip && has_sox && is_conv.expect("No choice!") {
-        let conv_format: &str = if is_format_valid {
-            // TODO: get args.format
-            println!();
-            "flac"
-        } else {
-            Select::new("Select format:", vec!["flac", "mp3", "aiff", "ogg"]).prompt().unwrap()
-        };
+    if !is_skip {
+        let is_conv = Confirm::new("SoX detected. Convert audio format?").prompt();
 
-        let conv_name = &wav_name.replace(".wav", &format!(".{}", conv_format));
-        ow_printl("\x1B[38;2;143;122;238mProcessing via SoX...\x1B[0m", 3);
+        if has_sox && is_conv.expect("No choice!") {
+            let conv_format: &str = if is_format_valid {
+                &*args.format.unwrap()
+            } else {
+                Select::new("Select format:", vec!["flac", "mp3", "aiff", "ogg"]).prompt().unwrap()
+            };
 
-        Command::new("sox")
-            .arg(wav_name)
-            .arg(conv_name)
-            .output()
-            .expect("SoX failed to convert file.");
+            let conv_name = &wav_name.replace(".wav", &format!(".{}", conv_format));
+            ow_printl("\x1B[38;2;143;122;238mProcessing via SoX...\x1B[0m", 3);
 
-        ow_printl(&format!("\x1B[38;2;41;255;188m{} → {} converted ✔\x1B[0m", HumanBytes(wav_meta.size()), HumanBytes(fs::metadata(conv_name).unwrap().size())), 3);
+            Command::new("sox")
+                .arg(wav_name)
+                .arg(conv_name)
+                .output()
+                .expect("SoX failed to convert file.");
 
-        fs::remove_file(wav_name).expect("Could not remove .wav file");
+            ow_printl(&format!("\x1B[38;2;41;255;188m{} → {} converted ✔\x1B[0m", HumanBytes(wav_meta.size()), HumanBytes(fs::metadata(conv_name).unwrap().size())), 3);
 
-        let mut tag = Tag::default().read_from_path(conv_name).unwrap();
-        tag.set_title(&*file.name);
-        tag.set_artist(&*file.authors.iter()
-            .map(|a| a.name.clone())
-            .collect::<Vec<String>>()
-            .join(", "));
+            fs::remove_file(wav_name).expect("Could not remove .wav file");
 
-        if let Some(album) = args.album {
-            tag.set_album(Album::with_title(&album));
+            let mut tag = Tag::default().read_from_path(conv_name).unwrap();
+            tag.set_title(&*file.name);
+            tag.set_artist(&*file.authors.iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<String>>()
+                .join(", "));
+
+            if let Some(album) = args.album {
+                tag.set_album(Album::with_title(&album));
+            }
+
+            if let Some((ca_file, ca_mime)) = ca_data {
+                tag.set_album_cover(Picture::new(&*ca_file, ca_mime));
+            }
+
+            tag.set_year(hrtime.year());
+            tag.set_comment("Processed by smwc2wav".into());
+            tag.set_genre("Game");
+
+            tag.write_to_path(conv_name).expect("Failed to save ID3 tags");
         }
-
-        if let Some((ca_file, ca_mime)) = ca_data {
-            tag.set_album_cover(Picture::new(&*ca_file, ca_mime));
-        }
-
-        tag.set_year(hrtime.year());
-        tag.set_comment("Processed by smwc2wav".into());
-        tag.set_genre("Game");
-
-        tag.write_to_path(conv_name).expect("Failed to save ID3 tags");
     }
 }
