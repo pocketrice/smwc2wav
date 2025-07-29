@@ -5,7 +5,7 @@ Elegantly simple CLI tool for browsing/downloading/converting SMW Central .spc s
 
 
 ### Dependencies
-<a href="https://github.com/jprjr/spc2wav">spc2wav</a> ≥v1.x
+<a href="https://github.com/jprjr/spc2wav">spc2wav</a> ≥1.x
 
 <a href="https://linux.die.net/man/1/sox">SoX</a> <em>(for conversion; optional)</em> ≥14.x 
 
